@@ -5,7 +5,7 @@ production teams do: image in **Amazon ECR**, containers in **private subnets** 
 **Application Load Balancer**, **zero-downtime blue/green releases** with automatic rollback,
 and **auto scaling**. All infrastructure is defined in **CloudFormation**.
 
-> Start with the beginner lab [Deploy a Website to ECR and ECS Fargate](https://github.com/KwakuAdae/aws-ecr-ecs-fargate-lab)
+> Start with the beginner lab [Deploy a Website to ECR and ECS Fargate](https://github.com/KwakuAdae/aws-ecs-fargate-website-lab)
 > if you're new to ECS. It uses the default VPC, a public IP per task and CLI scripts.
 > This lab replaces each of those shortcuts with the production pattern.
 
@@ -267,7 +267,7 @@ The stacks are deleted in reverse order: service → ECR (with its images) → n
   green version on the test listener before production shifts
 - **CI/CD**: GitHub Actions with OIDC → build, push, `03-deploy-service.sh $GITHUB_SHA`
 - Run on **Fargate Spot** with a capacity provider strategy
-- Sister labs: [ECS Fargate basics](https://github.com/KwakuAdae/aws-ecr-ecs-fargate-lab) ·
+- Sister labs: [ECS Fargate basics](https://github.com/KwakuAdae/aws-ecs-fargate-website-lab) ·
   [EKS microservices](https://github.com/KwakuAdae/aws-eks-microservices-lab) ·
   [API Gateway + SAM](https://github.com/KwakuAdae/aws-api-gateway-sam-lab) ·
   [CloudWatch Logs + Terraform](https://github.com/KwakuAdae/aws-cloudwatch-logs-terraform-lab)
