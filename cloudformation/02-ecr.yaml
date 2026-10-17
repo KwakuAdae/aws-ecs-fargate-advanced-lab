@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Fargate advanced lab - ECR repository with immutable tags, scan on push and a lifecycle
+  policy that keeps only the 10 most recent images.
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: fargate-advanced-web
+    AllowedPattern: "^[a-z0-9]+([._/-][a-z0-9]+)*$"
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageTagMutability: IMMUTABLE        # a tag (v1, v2...) can never be overwritten
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true                  # lets the stack delete the repo even with images in it
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 10 most recent images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+    Export: { Name: !Sub "${AWS::StackName}-RepositoryUri" }
+  RepositoryName:
+    Value: !Ref Repository
+    Export: { Name: !Sub "${AWS::StackName}-RepositoryName" }

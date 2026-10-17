@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Fargate advanced lab - service: Application Load Balancer, ECS cluster, task definition and
+  a Fargate service in private subnets with ECS native blue/green deployments, automatic
+  rollback and auto scaling.
+
+Parameters:
+  NetworkStack:
+    Type: String
+    Default: fargate-adv-network
+    Description: Name of the network stack (01-network.yaml)
+  EcrStack:
+    Type: String
+    Default: fargate-adv-ecr
+    Description: Name of the ECR stack (02-ecr.yaml)
+  ImageTag:
+    Type: String
+    Default: v1
+    Description: Image tag to deploy. Changing it starts a blue/green deployment
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  MinCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  MaxCapacity:
+    Type: Number
+    Default: 6
+    MinValue: 1
+  BakeTimeInMinutes:
+    Type: Number
+    Default: 3
+    MinValue: 0
+    MaxValue: 1440
+    Description: How long both versions stay up after production traffic moves to green (instant rollback window)
+  TestListenerCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Who may reach the test listener (port 8080). Use your IP/32 to keep it private
+
+Resources:
+  # =====================================================================================
+  # Security groups: internet → ALB (80, 8080) → tasks (8080 only from the ALB)
+  # =====================================================================================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer - HTTP from the internet, test port from TestListenerCidr
+      VpcId: { "Fn::ImportValue": !Sub "${NetworkStack}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: Production listener }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref TestListenerCidr, Description: Test listener }
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-alb-sg" }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate tasks - only the load balancer may connect
+      VpcId: { "Fn::ImportValue": !Sub "${NetworkStack}-VpcId" }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: From the ALB only
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-task-sg" }
+
+  # =====================================================================================
+  # Application Load Balancer with two target groups (blue + green) and two listeners
+  # =====================================================================================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Split [",", { "Fn::ImportValue": !Sub "${NetworkStack}-PublicSubnets" }]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-blue"
+      VpcId: { "Fn::ImportValue": !Sub "${NetworkStack}-VpcId" }
+      TargetType: ip                  # Fargate tasks register by IP
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "15" }
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-green"
+      VpcId: { "Fn::ImportValue": !Sub "${NetworkStack}-VpcId" }
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "15" }
+
+  ProductionListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: { StatusCode: "404", ContentType: text/plain, MessageBody: "Not found" }
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: { StatusCode: "404", ContentType: text/plain, MessageBody: "Not found" }
+
+  # ECS moves traffic between blue and green by changing the weights in these rules
+  ProductionListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ProductionListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ["/*"] }
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - { TargetGroupArn: !Ref BlueTargetGroup, Weight: 100 }
+              - { TargetGroupArn: !Ref GreenTargetGroup, Weight: 0 }
+
+  TestListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref TestListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ["/*"] }
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - { TargetGroupArn: !Ref BlueTargetGroup, Weight: 100 }
+              - { TargetGroupArn: !Ref GreenTargetGroup, Weight: 0 }
+
+  # =====================================================================================
+  # IAM roles
+  # =====================================================================================
+  # Used by ECS itself to pull the image from ECR and write logs
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  # Used by the running container. Only needs ECS Exec (SSM messages) in this lab
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  # Lets ECS change the listener rules during blue/green deployments
+  EcsInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers"
+
+  # =====================================================================================
+  # ECS cluster, task definition, service
+  # =====================================================================================
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 7
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-web"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub
+            - "${Uri}:${ImageTag}"
+            - Uri: { "Fn::ImportValue": !Sub "${EcrStack}-RepositoryUri" }
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 8080, Protocol: tcp }
+          HealthCheck:
+            Command: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-web"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 30
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED            # tasks are private; only the ALB is public
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${NetworkStack}-PrivateSubnets" }]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 8080
+          TargetGroupArn: !Ref BlueTargetGroup
+          AdvancedConfiguration:
+            AlternateTargetGroupArn: !Ref GreenTargetGroup
+            ProductionListenerRule: !Ref ProductionListenerRule
+            TestListenerRule: !Ref TestListenerRule
+            RoleArn: !GetAtt EcsInfrastructureRole.Arn
+      DeploymentConfiguration:
+        Strategy: BLUE_GREEN
+        BakeTimeInMinutes: !Ref BakeTimeInMinutes
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:             # roll back if the new tasks can't become healthy
+          Enable: true
+          Rollback: true
+        Alarms:                               # roll back if users see errors during the deployment
+          AlarmNames: [!Ref Target5xxAlarm]
+          Enable: true
+          Rollback: true
+
+  # =====================================================================================
+  # Rollback alarm + auto scaling
+  # =====================================================================================
+  Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-target-5xx"
+      AlarmDescription: Containers returned 5XX errors (used to roll back deployments)
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub "service/${Cluster}/${Service.Name}"
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-cpu-60"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+  MemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-memory-70"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+Outputs:
+  ProductionUrl:
+    Description: What your users see
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  TestUrl:
+    Description: The new (green) version during a deployment, before it gets production traffic
+    Value: !Sub "http://${LoadBalancer.DNSName}:8080"
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  LogGroupName:
+    Value: !Ref LogGroup
